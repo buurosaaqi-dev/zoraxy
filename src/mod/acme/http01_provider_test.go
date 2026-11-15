@@ -209,6 +209,51 @@ func TestObtainCertContext_TimeoutAndConcurrentHTTP01(t *testing.T) {
 	})
 }
 
+func TestAutoRenewer_OverlapAndLifecycle(t *testing.T) {
+	h, cleanup := newIsolatedACMEHandler(t, "0")
+	defer cleanup()
+
+	cfgPath := filepath.Join(t.TempDir(), "autorenew.json")
+	renewer, err := NewAutoRenewer(cfgPath, filepath.Join("conf", "certs"), 3600, 30, h, newTestLogger(t))
+	if err != nil {
+		t.Fatalf("NewAutoRenewer: %v", err)
+	}
+	defer renewer.Close()
+	renewer.RenewerConfig.Enabled = true
+	renewer.RenewerConfig.Email = "a@example.com"
+
+	renewer.renewMu.Lock()
+	var overlapErr error
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, overlapErr = renewer.CheckAndRenewCertificates()
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		renewer.renewMu.Unlock()
+		t.Fatal("overlapping CheckAndRenewCertificates blocked")
+	}
+	renewer.renewMu.Unlock()
+
+	if !errors.Is(overlapErr, ErrAutoRenewInProgress) {
+		t.Fatalf("expected ErrAutoRenewInProgress, got %v", overlapErr)
+	}
+	if renewed, err := renewer.CheckAndRenewCertificates(); err != nil || len(renewed) != 0 {
+		t.Fatalf("unexpected empty-folder renewal result: renewed=%v err=%v", renewed, err)
+	}
+
+	// Safe before StartAutoRenewTicker and across repeated Close calls.
+	renewer.RenewerConfig.Enabled = false
+	renewer.Close()
+	renewer.RunStartupCheck()
+	renewer.StartAutoRenewTicker()
+	renewer.StartAutoRenewTicker()
+	renewer.Close()
+	renewer.Close()
+}
+
 func newTestLogger(t *testing.T) *logger.Logger {
 	t.Helper()
 	l, err := logger.NewFmtLogger()

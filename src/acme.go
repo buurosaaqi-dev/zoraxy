@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -11,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"imuslab.com/zoraxy/mod/acme"
@@ -27,6 +29,13 @@ import (
 // acmeTokenRegex validates ACME HTTP-01 challenge tokens (RFC 8555).
 // Token format: base64url encoded, characters [A-Za-z0-9_-].
 var acmeTokenRegex = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
+var (
+	acmeHTTP01ToggleMu        sync.Mutex
+	acmeHTTP01ToggleRefs      int
+	acmeHTTP01RestorePort80   bool
+	acmeHTTP01RestoreRedirect bool
+)
 
 // Helper function to generate a random port above a specified value
 func getRandomPort(minPort int) int {
@@ -151,39 +160,70 @@ func acmeDeregisterSpecialRoutingRule() {
 	dynamicProxyRouter.RemoveRoutingRule("acme-autorenew")
 }
 
-// This function check if the renew setup is satisfied. If not, toggle them automatically
-func AcmeCheckAndHandleRenewCertificate(w http.ResponseWriter, r *http.Request) {
-	requireRestoreHttpsRedirect := false
-	requireRestorePort80 := false
-	dnsPara, _ := utils.PostBool(r, "dns")
-	if !dnsPara {
-		// HTTP-01 challenge
+func acquireHTTP01Listeners() (bool, error) {
+	acmeHTTP01ToggleMu.Lock()
+	defer acmeHTTP01ToggleMu.Unlock()
+
+	if acmeHTTP01ToggleRefs == 0 {
 		switch dynamicProxyRouter.Option.Port {
 		case 443:
-			// Check if port 80 is enabled
 			if !dynamicProxyRouter.Option.ListenOnPort80 {
-				// Enable port 80 temporarily
 				SystemWideLogger.PrintAndLog("ACME", "Temporarily enabling port 80 listener to handle ACME request ", nil)
 				dynamicProxyRouter.UpdatePort80ListenerState(true)
-				requireRestorePort80 = true
-				time.Sleep(2 * time.Second)
+				acmeHTTP01RestorePort80 = true
 			}
-
-			// Enable port 80 to 443 redirect
 			if !dynamicProxyRouter.Option.ForceHttpsRedirect {
 				SystemWideLogger.Println("Temporary enabling HTTP to HTTPS redirect for ACME certificate renew requests")
 				dynamicProxyRouter.UpdateHttpToHttpsRedirectSetting(true)
-				// Mark that we need to restore this setting after renewal
-				requireRestoreHttpsRedirect = true
+				acmeHTTP01RestoreRedirect = true
 			}
-
 		case 80:
-			// Go ahead
-
+			// Already listening on port 80.
 		default:
-			// This port do not support ACME
-			utils.SendErrorResponse(w, "ACME renew only support web server listening on port 80 (http) or 443 (https)")
+			return false, errors.New("ACME renew only support web server listening on port 80 (http) or 443 (https)")
+		}
+	}
+
+	acmeHTTP01ToggleRefs++
+	return acmeHTTP01ToggleRefs == 1 && acmeHTTP01RestorePort80, nil
+}
+
+func releaseHTTP01Listeners() {
+	acmeHTTP01ToggleMu.Lock()
+	defer acmeHTTP01ToggleMu.Unlock()
+
+	if acmeHTTP01ToggleRefs <= 0 {
+		return
+	}
+	acmeHTTP01ToggleRefs--
+	if acmeHTTP01ToggleRefs > 0 {
+		return
+	}
+
+	if acmeHTTP01RestorePort80 {
+		SystemWideLogger.PrintAndLog("ACME", "Restoring previous port 80 listener settings", nil)
+		dynamicProxyRouter.UpdatePort80ListenerState(false)
+		acmeHTTP01RestorePort80 = false
+	}
+	if acmeHTTP01RestoreRedirect {
+		SystemWideLogger.PrintAndLog("ACME", "Restoring HTTP to HTTPS redirect settings", nil)
+		dynamicProxyRouter.UpdateHttpToHttpsRedirectSetting(false)
+		acmeHTTP01RestoreRedirect = false
+	}
+}
+
+// This function check if the renew setup is satisfied. If not, toggle them automatically
+func AcmeCheckAndHandleRenewCertificate(w http.ResponseWriter, r *http.Request) {
+	dnsPara, _ := utils.PostBool(r, "dns")
+	if !dnsPara {
+		port80Changed, err := acquireHTTP01Listeners()
+		if err != nil {
+			utils.SendErrorResponse(w, err.Error())
 			return
+		}
+		defer releaseHTTP01Listeners()
+		if port80Changed {
+			time.Sleep(2 * time.Second)
 		}
 	}
 
@@ -195,18 +235,6 @@ func AcmeCheckAndHandleRenewCertificate(w http.ResponseWriter, r *http.Request) 
 
 	// Update the TLS cert store buffer
 	tlsCertManager.UpdateLoadedCertList()
-
-	// Restore original settings only if they were changed
-	if requireRestorePort80 {
-		// Restore port 80 listener
-		SystemWideLogger.PrintAndLog("ACME", "Restoring previous port 80 listener settings", nil)
-		dynamicProxyRouter.UpdatePort80ListenerState(false)
-	}
-	if requireRestoreHttpsRedirect {
-		// Restore HTTP to HTTPS redirect setting that was temporarily enabled
-		SystemWideLogger.PrintAndLog("ACME", "Restoring HTTP to HTTPS redirect settings", nil)
-		dynamicProxyRouter.UpdateHttpToHttpsRedirectSetting(false)
-	}
 }
 
 // HandleACMEPreferredCA return the user preferred / default CA for new subdomain auto creation

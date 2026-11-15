@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"imuslab.com/zoraxy/mod/info/logger"
@@ -20,6 +21,9 @@ import (
 
 	This script handle auto renew
 */
+
+// ErrAutoRenewInProgress is returned when a renewal scan is already running.
+var ErrAutoRenewInProgress = errors.New("certificate auto-renewal is already in progress")
 
 type AutoRenewConfig struct {
 	Enabled      bool     //Automatic renew is enabled
@@ -38,6 +42,9 @@ type AutoRenewer struct {
 	EarlyRenewDays    int //How many days before cert expire to renew certificate
 	TickerstopChan    chan bool
 	Logger            *logger.Logger //System wide logger
+
+	renewMu  sync.Mutex
+	tickerMu sync.Mutex
 }
 
 type ExpiredCerts struct {
@@ -96,33 +103,50 @@ func NewAutoRenewer(config string, certFolder string, renewCheckInterval int64, 
 	thisRenewer.Logf("ACME early renew set to "+fmt.Sprint(earlyRenewDays)+" days and check interval set to "+fmt.Sprint(renewCheckInterval)+" seconds", nil)
 
 	if thisRenewer.RenewerConfig.Enabled {
-		//Start the renew ticker
+		// Start the renew ticker; the immediate startup scan is deferred to
+		// RunStartupCheck once HTTP listeners and routing rules are active.
 		thisRenewer.StartAutoRenewTicker()
-
-		//Check and renew certificate on startup
-		go thisRenewer.CheckAndRenewCertificates()
 	}
 
 	return &thisRenewer, nil
 }
 
+// RunStartupCheck triggers the initial certificate renewal check in the background
+// if auto-renew is enabled. Call after the reverse proxy and ACME routing rule are ready.
+func (a *AutoRenewer) RunStartupCheck() {
+	if a.RenewerConfig != nil && a.RenewerConfig.Enabled {
+		go a.CheckAndRenewCertificates()
+	}
+}
+
 func (a *AutoRenewer) Logf(message string, err error) {
-	a.Logger.PrintAndLog("cert-renew", message, err)
+	if a.Logger != nil {
+		a.Logger.PrintAndLog("cert-renew", message, err)
+	}
+}
+
+func (a *AutoRenewer) stopTickerLocked() {
+	if a.TickerstopChan != nil {
+		select {
+		case a.TickerstopChan <- true:
+		default:
+		}
+		a.TickerstopChan = nil
+	}
 }
 
 func (a *AutoRenewer) StartAutoRenewTicker() {
-	//Stop the previous ticker if still running
-	if a.TickerstopChan != nil {
-		a.TickerstopChan <- true
-	}
-
-	time.Sleep(1 * time.Second)
+	a.tickerMu.Lock()
+	a.stopTickerLocked()
 
 	ticker := time.NewTicker(time.Duration(a.RenewTickInterval) * time.Second)
-	done := make(chan bool)
+	done := make(chan bool, 1)
+	a.TickerstopChan = done
+	a.tickerMu.Unlock()
 
 	//Start the ticker to check and renew every x seconds
 	go func(a *AutoRenewer) {
+		defer ticker.Stop()
 		for {
 			select {
 			case <-done:
@@ -133,16 +157,12 @@ func (a *AutoRenewer) StartAutoRenewTicker() {
 			}
 		}
 	}(a)
-
-	a.TickerstopChan = done
 }
 
 func (a *AutoRenewer) StopAutoRenewTicker() {
-	if a.TickerstopChan != nil {
-		a.TickerstopChan <- true
-	}
-
-	a.TickerstopChan = nil
+	a.tickerMu.Lock()
+	defer a.tickerMu.Unlock()
+	a.stopTickerLocked()
 }
 
 // Handle update auto renew domains
@@ -290,6 +310,12 @@ func (a *AutoRenewer) HandleACMEEmail(w http.ResponseWriter, r *http.Request) {
 // certificate folder and return a list of certs that is renewed in this call
 // Return string array with length 0 when no cert is expired
 func (a *AutoRenewer) CheckAndRenewCertificates() ([]string, error) {
+	if !a.renewMu.TryLock() {
+		a.Logf("Certificate auto-renewal is already in progress, skipping duplicate run", nil)
+		return []string{}, ErrAutoRenewInProgress
+	}
+	defer a.renewMu.Unlock()
+
 	certFolder := a.CertFolder
 	files, err := os.ReadDir(certFolder)
 	if err != nil {
@@ -357,9 +383,7 @@ func (a *AutoRenewer) CheckAndRenewCertificates() ([]string, error) {
 
 // Close the auto renewer
 func (a *AutoRenewer) Close() {
-	if a.TickerstopChan != nil {
-		a.TickerstopChan <- true
-	}
+	a.StopAutoRenewTicker()
 }
 
 // Renew the certificate by filename extract all DNS name from the

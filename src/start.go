@@ -35,6 +35,7 @@ import (
 	"imuslab.com/zoraxy/mod/info/shellexec"
 	"imuslab.com/zoraxy/mod/info/usageinfo"
 	"imuslab.com/zoraxy/mod/mdns"
+	"imuslab.com/zoraxy/mod/mtls"
 	"imuslab.com/zoraxy/mod/netstat"
 	"imuslab.com/zoraxy/mod/pathrule"
 	"imuslab.com/zoraxy/mod/plugins"
@@ -43,7 +44,6 @@ import (
 	"imuslab.com/zoraxy/mod/statistic"
 	"imuslab.com/zoraxy/mod/statistic/analytic"
 	"imuslab.com/zoraxy/mod/streamproxy"
-	"imuslab.com/zoraxy/mod/mtls"
 	"imuslab.com/zoraxy/mod/tlscert"
 	"imuslab.com/zoraxy/mod/webserv"
 )
@@ -463,6 +463,16 @@ func finalSequence() {
 
 	//Set the host specific TLS behavior resolver for resolving TLS behavior for each hostname
 	tlsCertManager.SetHostSpecificTlsBehavior(dynamicProxyRouter.ResolveHostSpecificTlsBehaviorForHostname)
+
+	// Run initial auto-renewal only after the special ACME routing rule and
+	// port 80/443 proxy listeners are both active.
+	go func() {
+		<-dynamicProxyServiceReady
+		time.Sleep(500 * time.Millisecond)
+		if acmeAutoRenewer != nil {
+			acmeAutoRenewer.RunStartupCheck()
+		}
+	}()
 }
 
 /* Shutdown Sequence */
@@ -500,6 +510,9 @@ func ShutdownSeq() {
 	SystemWideLogger.Println("Closing Certificates Auto Renewer")
 	if acmeAutoRenewer != nil {
 		acmeAutoRenewer.Close()
+	}
+	if acmeHandler != nil {
+		acmeHandler.Close()
 	}
 
 	if accessController != nil {

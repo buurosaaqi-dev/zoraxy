@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"imuslab.com/zoraxy/mod/auth"
@@ -29,9 +30,17 @@ const (
 )
 
 var (
-	dynamicProxyRouter      *dynamicproxy.Router
-	dynamicProxyRouterReady = make(chan bool, 1)
+	dynamicProxyRouter       *dynamicproxy.Router
+	dynamicProxyRouterReady  = make(chan bool, 1)
+	dynamicProxyServiceReady = make(chan struct{})
+	dynamicProxyServiceOnce  sync.Once
 )
+
+func signalDynamicProxyServiceReady() {
+	dynamicProxyServiceOnce.Do(func() {
+		close(dynamicProxyServiceReady)
+	})
+}
 
 type globalProxyTimeoutSettings struct {
 	ReadHeaderTimeout int `json:"readHeaderTimeout"`
@@ -106,6 +115,7 @@ func parseCaptchaConfigFromRequest(r *http.Request) (*dynamicproxy.CaptchaConfig
 
 // Add user customizable reverse proxy
 func ReverseProxyInit() {
+	defer signalDynamicProxyServiceReady()
 	/*
 		Load Reverse Proxy Ingress Settings
 	*/
@@ -288,6 +298,7 @@ func ReverseProxyInit() {
 		dynamicProxyRouter.StartProxyService()
 		SystemWideLogger.Println("Dynamic Reverse Proxy service started")
 	}
+	signalDynamicProxyServiceReady()
 
 	//Add all proxy services to uptime monitor
 	//Create a uptime monitor service
@@ -613,12 +624,12 @@ func ReverseProxyHandleAddEndpoint(w http.ResponseWriter, r *http.Request) {
 
 			Tags: tags,
 			// Uptime Monitor
-			DisableUptimeMonitor: !enableUtm,
-			UptimeMonitorURI:     utmURI,
-			UptimeMonitorMethod:  utmMethod,
+			DisableUptimeMonitor:    !enableUtm,
+			UptimeMonitorURI:        utmURI,
+			UptimeMonitorMethod:     utmMethod,
 			UptimeMonitorInterval:   utmInterval,
 			UptimeMonitorMaxRecords: utmMaxRecords,
-			DisableAutoFallback:  false, // Default to false for new endpoints
+			DisableAutoFallback:     false, // Default to false for new endpoints
 
 			// Logger
 			DisableLogging: disableLog,
