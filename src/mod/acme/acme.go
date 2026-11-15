@@ -18,13 +18,13 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-acme/lego/v5/acme"
 	"github.com/go-acme/lego/v5/certcrypto"
 	"github.com/go-acme/lego/v5/certificate"
 	"github.com/go-acme/lego/v5/challenge/dns01"
-	"github.com/go-acme/lego/v5/challenge/http01"
 	"github.com/go-acme/lego/v5/lego"
 	"github.com/go-acme/lego/v5/registration"
 	"imuslab.com/zoraxy/mod/database"
@@ -39,6 +39,14 @@ var defaultNameservers = []string{
 	"1.1.1.1:53", // Cloudflare DNS
 	"1.0.0.1:53", // Cloudflare DNS
 }
+
+const (
+	defaultHTTP01Timeout    = 2 * time.Minute
+	maxHTTP01Timeout        = 5 * time.Minute
+	minDNS01PropTimeoutSecs = 300
+	dns01TimeoutHeadroom    = 2 * time.Minute
+	maxDNS01Timeout         = 30 * time.Minute
+)
 
 type CertificateInfoJSON struct {
 	AcmeName                     string   `json:"acme_name"`                       // ACME provider name
@@ -64,6 +72,12 @@ type ACMEHandler struct {
 	TestMode       bool
 	KeyFileMode    os.FileMode
 	PublicFileMode os.FileMode
+
+	providerOnce sync.Once
+	http01       *http01Provider
+	accountMu    sync.Mutex
+	certLocksMu  sync.Mutex
+	certLocks    map[string]*sync.Mutex
 }
 
 // NewACME creates a new ACMEHandler instance.
@@ -71,7 +85,7 @@ func NewACME(
 	port string, database *database.Database,
 	logger *logger.Logger, testMode bool, keyFileMode os.FileMode, publicFileMode os.FileMode,
 ) *ACMEHandler {
-	return &ACMEHandler{
+	h := &ACMEHandler{
 		Port:           port,
 		Database:       database,
 		Logger:         logger,
@@ -79,16 +93,70 @@ func NewACME(
 		KeyFileMode:    keyFileMode,
 		PublicFileMode: publicFileMode,
 	}
+	h.getHTTP01Provider()
+	return h
+}
+
+func (a *ACMEHandler) getHTTP01Provider() *http01Provider {
+	a.providerOnce.Do(func() {
+		a.http01 = newHTTP01Provider(a.Port, a.Logger)
+	})
+	return a.http01
+}
+
+func (a *ACMEHandler) lockCert(certificateName string) func() {
+	if certificateName == "" {
+		return func() {}
+	}
+	a.certLocksMu.Lock()
+	if a.certLocks == nil {
+		a.certLocks = make(map[string]*sync.Mutex)
+	}
+	mu, ok := a.certLocks[certificateName]
+	if !ok {
+		mu = &sync.Mutex{}
+		a.certLocks[certificateName] = mu
+	}
+	a.certLocksMu.Unlock()
+
+	mu.Lock()
+	return mu.Unlock
+}
+
+func certObtainTimeout(useDNS bool, propagationTimeout int, domainCount int) time.Duration {
+	if domainCount < 1 {
+		domainCount = 1
+	}
+	if !useDNS {
+		timeout := defaultHTTP01Timeout + time.Duration(domainCount-1)*30*time.Second
+		if timeout > maxHTTP01Timeout {
+			return maxHTTP01Timeout
+		}
+		return timeout
+	}
+
+	propSecs := propagationTimeout
+	if propSecs < minDNS01PropTimeoutSecs {
+		propSecs = minDNS01PropTimeoutSecs
+	}
+	timeout := time.Duration(propSecs*domainCount)*time.Second + dns01TimeoutHeadroom
+	if timeout > maxDNS01Timeout {
+		return maxDNS01Timeout
+	}
+	return timeout
 }
 
 func (a *ACMEHandler) Logf(message string, err error) {
-	a.Logger.PrintAndLog("ACME", message, err)
+	if a.Logger != nil {
+		a.Logger.PrintAndLog("ACME", message, err)
+	}
 }
 
-// Close closes the ACMEHandler.
-// ACME Handler does not need to close anything
-// Function defined for future compatibility
+// Close shuts down any active HTTP-01 challenge listener managed by this handler.
 func (a *ACMEHandler) Close() error {
+	if a.http01 != nil {
+		return a.http01.Close()
+	}
 	return nil
 }
 
@@ -103,7 +171,17 @@ func (a *ACMEHandler) writeFileWithMode(filename string, data []byte, mode os.Fi
 
 // ObtainCert obtains a certificate for the specified domains.
 func (a *ACMEHandler) ObtainCert(domains []string, certificateName string, email string, caName string, caUrl string, skipTLS bool, useDNS bool, propagationTimeout int, dnsServers string, disableRecursiveNssCheck bool, disableAuthoritativeNssCheck bool) (bool, error) {
-	ctx := context.TODO()
+	return a.ObtainCertContext(context.Background(), domains, certificateName, email, caName, caUrl, skipTLS, useDNS, propagationTimeout, dnsServers, disableRecursiveNssCheck, disableAuthoritativeNssCheck)
+}
+
+// ObtainCertContext obtains a certificate for the specified domains under parentCtx.
+func (a *ACMEHandler) ObtainCertContext(parentCtx context.Context, domains []string, certificateName string, email string, caName string, caUrl string, skipTLS bool, useDNS bool, propagationTimeout int, dnsServers string, disableRecursiveNssCheck bool, disableAuthoritativeNssCheck bool) (bool, error) {
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
+
+	unlockCert := a.lockCert(certificateName)
+	defer unlockCert()
 
 	a.Logf("Obtaining certificate for: "+strings.Join(domains, ", "), nil)
 
@@ -130,61 +208,6 @@ func (a *ACMEHandler) ObtainCert(domains []string, certificateName string, email
 		}
 	} else {
 		a.Logf("Using "+caUrl+" for CA Directory URL", nil)
-	}
-
-	// Reuse a previously registered ACME account for this CA if one is stored
-	// in the database. Only generate a new account key if no stored account
-	// is found.
-	var adminUser ACMEUser
-	accountLoaded := false
-	if loadedKey, loadedReg, ok := a.loadACMEAccount(caUrl, email); ok {
-		adminUser = ACMEUser{
-			Email:        email,
-			key:          loadedKey,
-			Registration: loadedReg,
-		}
-		accountLoaded = true
-		a.Logf("Reusing existing ACME account for "+caUrl, nil)
-	} else {
-		// generate private key
-		privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-		if err != nil {
-			a.Logf("Private key generation failed", err)
-			return false, err
-		}
-		// create a admin user for our new generation
-		adminUser = ACMEUser{
-			Email: email,
-			key:   privateKey,
-		}
-	}
-
-	// create config
-	config := lego.NewConfig(&adminUser)
-	config.CADirURL = caUrl
-
-	// skip TLS verify if need
-	// Ref: https://github.com/go-acme/lego/blob/6af2c756ac73a9cb401621afca722d0f4112b1b8/lego/client_config.go#L74
-	if skipTLS {
-		a.Logf("Ignoring TLS/SSL Verification Error for ACME Server", nil)
-		config.HTTPClient.Transport = &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			DialContext: (&net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-			TLSHandshakeTimeout:   30 * time.Second,
-			ResponseHeaderTimeout: 30 * time.Second,
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true,
-			},
-		}
-	}
-
-	client, err := lego.NewClient(config)
-	if err != nil {
-		a.Logf("Failed to spawn new ACME client from current config", err)
-		return false, err
 	}
 
 	// Load certificate info from JSON file
@@ -218,8 +241,19 @@ func (a *ACMEHandler) ObtainCert(domains []string, certificateName string, email
 		dnsNameservers[i] = strings.TrimSpace(dnsNameservers[i])
 	}
 
+	ctx, cancel := context.WithTimeout(parentCtx, certObtainTimeout(useDNS, propagationTimeout, len(domains)))
+	defer cancel()
+
+	client, err := a.prepareClientAndAccount(ctx, email, caUrl, skipTLS)
+	if err != nil {
+		return false, err
+	}
+
 	// setup how to receive challenge
 	if useDNS {
+		if a.Database == nil {
+			return false, errors.New("DNS Provider and DNS Credential configuration required for ACME Provider (Error -1)")
+		}
 		if !a.Database.TableExists("acme") {
 			a.Database.NewTable("acme")
 			return false, errors.New("DNS Provider and DNS Credential configuration required for ACME Provider (Error -1)")
@@ -274,83 +308,10 @@ func (a *ACMEHandler) ObtainCert(domains []string, certificateName string, email
 			return false, err
 		}
 	} else {
-		err = client.Challenge.SetHTTP01Provider(http01.NewProviderServer("", a.Port))
+		err = client.Challenge.SetHTTP01Provider(a.getHTTP01Provider())
 		if err != nil {
 			a.Logf("Failed to resolve HTTP01 Provider", err)
 			return false, err
-		}
-	}
-
-	// New users will need to register
-	/*
-		reg, err := client.Registration.Register(registration.RegisterOptions{TermsOfServiceAgreed: true})
-		if err != nil {
-			log.Println(err)
-			return false, err
-		}
-	*/
-	var reg *acme.ExtendedAccount
-	// New users will need to register. If we reused an account loaded from
-	// disk, it is already registered - registering again would count against
-	// the CA's "new registrations per IP" rate limit, so skip it entirely.
-	if accountLoaded {
-		reg = adminUser.Registration
-	} else if client.GetServerMetadata().ExternalAccountRequired {
-		a.Logf("External Account Required for this ACME Provider", nil)
-		// IF KID and HmacEncoded is overidden
-
-		if !a.Database.TableExists("acme") {
-			a.Database.NewTable("acme")
-			return false, errors.New("kid and HmacEncoded configuration required for ACME Provider (Error -1)")
-		}
-
-		if !a.Database.KeyExists("acme", config.CADirURL+"_kid") || !a.Database.KeyExists("acme", config.CADirURL+"_hmacEncoded") {
-			return false, errors.New("kid and HmacEncoded configuration required for ACME Provider (Error -2)")
-		}
-
-		var kid string
-		var hmacEncoded string
-		err := a.Database.Read("acme", config.CADirURL+"_kid", &kid)
-		if err != nil {
-			a.Logf("Failed to read kid from database", err)
-			return false, err
-		}
-
-		err = a.Database.Read("acme", config.CADirURL+"_hmacEncoded", &hmacEncoded)
-		if err != nil {
-			a.Logf("Failed to read HMAC from database", err)
-			return false, err
-		}
-
-		a.Logf("EAB Credential retrieved: "+kid+" / "+hmacEncoded, nil)
-		if kid != "" && hmacEncoded != "" {
-			reg, err = client.Registration.RegisterWithExternalAccountBinding(ctx, registration.RegisterEABOptions{
-				TermsOfServiceAgreed: true,
-				Kid:                  kid,
-				HmacEncoded:          hmacEncoded,
-			})
-		}
-		if err != nil {
-			a.Logf("Register with external account binder failed", err)
-			return false, err
-		}
-		// return false, errors.New("External Account Required for this ACME Provider.")
-	} else {
-		reg, err = client.Registration.Register(ctx, registration.RegisterOptions{TermsOfServiceAgreed: true})
-		if err != nil {
-			a.Logf("Unable to register client", err)
-			return false, err
-		}
-	}
-	adminUser.Registration = reg
-
-	// Persist a freshly registered account so future certificate requests and
-	// renewals reuse it instead of registering a brand new account each time.
-	if !accountLoaded && reg != nil {
-		if serr := a.saveACMEAccount(config.CADirURL, &adminUser); serr != nil {
-			a.Logf("Failed to persist ACME account (may hit account create limits, try a different IP)", serr)
-		} else {
-			a.Logf("Persisted ACME account for reuse on "+config.CADirURL, nil)
 		}
 	}
 
@@ -407,6 +368,119 @@ func (a *ACMEHandler) ObtainCert(domains []string, certificateName string, email
 	return true, nil
 }
 
+func (a *ACMEHandler) newLegoConfig(adminUser *ACMEUser, caUrl string, skipTLS bool) *lego.Config {
+	config := lego.NewConfig(adminUser)
+	config.CADirURL = caUrl
+
+	if skipTLS {
+		a.Logf("Ignoring TLS/SSL Verification Error for ACME Server", nil)
+		config.HTTPClient.Transport = &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			TLSHandshakeTimeout:   30 * time.Second,
+			ResponseHeaderTimeout: 30 * time.Second,
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+		}
+	}
+	return config
+}
+
+func (a *ACMEHandler) prepareClientAndAccount(ctx context.Context, email string, caUrl string, skipTLS bool) (*lego.Client, error) {
+	a.accountMu.Lock()
+	if err := ctx.Err(); err != nil {
+		a.accountMu.Unlock()
+		return nil, err
+	}
+
+	if a.Database != nil {
+		if loadedKey, loadedReg, ok := a.loadACMEAccount(caUrl, email); ok {
+			a.accountMu.Unlock()
+			adminUser := ACMEUser{
+				Email:        email,
+				key:          loadedKey,
+				Registration: loadedReg,
+			}
+			a.Logf("Reusing existing ACME account for "+caUrl, nil)
+			return lego.NewClient(a.newLegoConfig(&adminUser, caUrl, skipTLS))
+		}
+	}
+	defer a.accountMu.Unlock()
+
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		a.Logf("Private key generation failed", err)
+		return nil, err
+	}
+	adminUser := ACMEUser{Email: email, key: privateKey}
+
+	config := a.newLegoConfig(&adminUser, caUrl, skipTLS)
+	client, err := lego.NewClient(config)
+	if err != nil {
+		a.Logf("Failed to spawn new ACME client from current config", err)
+		return nil, err
+	}
+
+	var reg *acme.ExtendedAccount
+	if client.GetServerMetadata().ExternalAccountRequired {
+		a.Logf("External Account Required for this ACME Provider", nil)
+		if a.Database == nil {
+			return nil, errors.New("kid and HmacEncoded configuration required for ACME Provider (Error -1)")
+		}
+		if !a.Database.TableExists("acme") {
+			a.Database.NewTable("acme")
+			return nil, errors.New("kid and HmacEncoded configuration required for ACME Provider (Error -1)")
+		}
+		if !a.Database.KeyExists("acme", config.CADirURL+"_kid") || !a.Database.KeyExists("acme", config.CADirURL+"_hmacEncoded") {
+			return nil, errors.New("kid and HmacEncoded configuration required for ACME Provider (Error -2)")
+		}
+
+		var kid, hmacEncoded string
+		if err := a.Database.Read("acme", config.CADirURL+"_kid", &kid); err != nil {
+			a.Logf("Failed to read kid from database", err)
+			return nil, err
+		}
+		if err := a.Database.Read("acme", config.CADirURL+"_hmacEncoded", &hmacEncoded); err != nil {
+			a.Logf("Failed to read HMAC from database", err)
+			return nil, err
+		}
+
+		a.Logf("EAB Credential retrieved: "+kid+" / "+hmacEncoded, nil)
+		if kid != "" && hmacEncoded != "" {
+			reg, err = client.Registration.RegisterWithExternalAccountBinding(ctx, registration.RegisterEABOptions{
+				TermsOfServiceAgreed: true,
+				Kid:                  kid,
+				HmacEncoded:          hmacEncoded,
+			})
+		}
+		if err != nil {
+			a.Logf("Register with external account binder failed", err)
+			return nil, err
+		}
+	} else {
+		reg, err = client.Registration.Register(ctx, registration.RegisterOptions{TermsOfServiceAgreed: true})
+		if err != nil {
+			a.Logf("Unable to register client", err)
+			return nil, err
+		}
+	}
+	adminUser.Registration = reg
+
+	if a.Database != nil && reg != nil {
+		if serr := a.saveACMEAccount(config.CADirURL, &adminUser); serr != nil {
+			a.Logf("Failed to persist ACME account (may hit account create limits, try a different IP)", serr)
+		} else {
+			a.Logf("Persisted ACME account for reuse on "+config.CADirURL, nil)
+		}
+	}
+
+	return client, nil
+}
+
 // CheckCertificate returns a list of domains that are in expired certificates.
 // It will return all domains that is in expired certificates
 // *** if there is a vaild certificate contains the domain and there is a expired certificate contains the same domain
@@ -456,9 +530,9 @@ func (a *ACMEHandler) CheckCertificate() []string {
 	return expiredCerts
 }
 
-// return the current port number
+// Getport returns the current HTTP-01 challenge listener port.
 func (a *ACMEHandler) Getport() string {
-	return a.Port
+	return a.getHTTP01Provider().Port()
 }
 
 // contains checks if a string is present in a slice.
