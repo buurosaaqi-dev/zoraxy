@@ -288,6 +288,10 @@
                     },
                     error: function(error) {
                         console.log("Failed to install certificate:", error);
+                        msgbox("Failed to install certificate", false, 12000);
+                        if (callback != undefined){
+                            callback(false);
+                        }
                     }
                 });
             }
@@ -302,6 +306,11 @@
                         return;
                     }
                     requestCert(data.url.trim(), data.skipTLS);
+                }).fail(function(){
+                    msgbox("Failed to load custom ACME CA settings.", false);
+                    if (callback != undefined){
+                        callback(false);
+                    }
                 })
             } else {
                 requestCert();
